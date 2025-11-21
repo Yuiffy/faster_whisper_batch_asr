@@ -1,5 +1,5 @@
 # ==========================================
-#  DDTV Whisper 字幕生成启动器 (PowerShell版)
+#  daiFish Whisper 字幕生成启动器 (PowerShell版)
 # ==========================================
 param (
     [string]$VideoPath
@@ -14,7 +14,7 @@ $PythonScript = Join-Path $ScriptDir "fast_sub_batch_fix.py"
 
 Clear-Host
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "   DDTV 自动字幕生成工具 (RTX 5080 尊享版)   " -ForegroundColor Yellow
+Write-Host "   daiFish 自动字幕生成工具 (RTX 5080 尊享版)   " -ForegroundColor Yellow
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
