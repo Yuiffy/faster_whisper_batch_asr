@@ -4,19 +4,13 @@ import time
 import shutil
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
-# ================= 性能与精度配置 =================
-# 推荐 small，既快又准
-#MODEL_SIZE = "small" 
-# 5080 显存够大，维持高并发
-#BATCH_SIZE = 32  
-
-
-# 使用 HuggingFace 上的转换版 Turbo 模型
+# ================= 性能配置 =================
+# 使用 HuggingFace 上的转换版 Turbo 模型 (速度接近 Medium，精度接近 Large)
 MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
 
-# Batch Size 保持适中
+# Batch Size 保持适中，16 或 32 都可以
 BATCH_SIZE = 16
-# ===============================================
+# ===========================================
 
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -38,41 +32,55 @@ def main():
         # device="cuda" 强制使用显卡
         model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
         
-        # 使用 Batch Pipeline
         batched_model = BatchedInferencePipeline(model=model)
 
-        # 2. 准备 VAD 参数（解决烂尾的关键）
+        # 2. 准备 VAD 参数（防止烂尾）
         print("🔧 配置 VAD 参数以防止吞字...")
-        # 这些参数告诉模型：不要轻易丢弃结尾的声音
         vad_params = {
-            "min_silence_duration_ms": 2000, # 必须要静音超过2秒才算静音（之前可能默认是0.5秒）
-            "speech_pad_ms": 1500,           # 在人声前后强行多保留 1.5 秒的音频，防止掐头去尾
+            "min_silence_duration_ms": 2000, 
+            "speech_pad_ms": 1500,           
         }
 
-        # 3. 预处理
+        # 3. 预处理获取时长
         print("🔍 分析音频流...")
-        # 获取时长
+        # 这里的 batch_size 仅用于快速探测，不影响后续
         dummy_gen, info = batched_model.transcribe(video_path, batch_size=BATCH_SIZE)
         total_duration = info.duration
         
         print(f"✅ 视频总长: {format_timestamp(total_duration)}")
-        print("🚀 竞速模式启动 (已开启防烂尾补丁)...")
+        print("🚀 竞速模式启动 (Turbo模型 + 防烂尾 + 防覆盖)...")
         print("=" * 50)
 
+        # --- 🛡️ 核心修改：智能防覆盖逻辑 🛡️ ---
         output_dir = os.path.dirname(video_path)
         filename_no_ext = os.path.splitext(os.path.basename(video_path))[0]
         srt_path = os.path.join(output_dir, filename_no_ext + ".srt")
         
+        # 循环检测：如果文件存在，就加后缀 _1, _2, _3...
+        counter = 1
+        original_srt_path = srt_path # 记录一下原本想存的名字
+        while os.path.exists(srt_path):
+            new_filename = f"{filename_no_ext}_{counter}.srt"
+            srt_path = os.path.join(output_dir, new_filename)
+            counter += 1
+            
+        if counter > 1:
+            print(f"⚠️  检测到同名文件: {os.path.basename(original_srt_path)}")
+            print(f"✨ 自动重命名为: {os.path.basename(srt_path)}")
+        else:
+            print(f"💾 准备保存为: {os.path.basename(srt_path)}")
+        # ---------------------------------------
+        
         start_time = time.time()
         
-        # 4. 开始转写 (带上 vad_parameters)
+        # 4. 开始转写
         segments, _ = batched_model.transcribe(
             video_path, 
             batch_size=BATCH_SIZE,
             language="zh",
             initial_prompt="以下是二次元虚拟主播直播录像，主要用简体中文。",
-            vad_filter=True,            # 开启 VAD
-            vad_parameters=vad_params   # 注入我们的宽松参数
+            vad_filter=True,            
+            vad_parameters=vad_params   
         )
 
         # 准备进度条
@@ -106,7 +114,7 @@ def main():
         print("\n" + "=" * 50)
         print(f"🏆 任务完成！")
         print(f"⏱️  耗时: {total_time:.2f}秒 ({total_duration/total_time:.1f}倍速)")
-        print(f"💾 字幕: {srt_path}")
+        print(f"💾 字幕已保存: {srt_path}")
 
     except Exception as e:
         print(f"\n\n❌ 发生错误: {e}")
