@@ -63,7 +63,7 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
             video_path, 
             batch_size=BATCH_SIZE,
             language="zh",
-            initial_prompt="以下是二次元虚拟主播直播录像，主要用简体中文。",
+            initial_prompt="以下是二次元活泼快嘴现充川妹虚拟主播直播录像，杂谈唱歌、看电影、玩游戏，主要用简体中文，偶尔日文英文，生成合适长度的视频字幕。",
             vad_filter=True,            
             vad_parameters=vad_params   
         )

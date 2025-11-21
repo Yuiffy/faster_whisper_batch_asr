@@ -7,6 +7,7 @@ from faster_whisper import WhisperModel, BatchedInferencePipeline
 # ================= 性能配置 =================
 # 使用 HuggingFace 上的转换版 Turbo 模型 (速度接近 Medium，精度接近 Large)
 MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
+# MODEL_SIZE = "large-v3"
 
 # Batch Size 保持适中，16 或 32 都可以
 BATCH_SIZE = 16
