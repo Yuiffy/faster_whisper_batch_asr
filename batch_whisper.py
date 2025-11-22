@@ -56,6 +56,12 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
         total_duration = info.duration
         print(f" -> {format_timestamp(total_duration)}")
 
+        # --- 跳过过短视频 ---
+        if total_duration < 2.0:
+            print(f"   ⏭️  [跳过] 视频时长过短 (<2秒): {filename} ({format_timestamp(total_duration)})")
+            return
+        # ------------------
+
         # 2. 开始转写
         start_time = time.time()
         
