@@ -12,9 +12,12 @@ MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
 # 显存够大，Batch Size 设为 16
 BATCH_SIZE = 16
 
-# 【核心修改】单行最大字数限制
-# 超过这个长度(比如18个中文字)就会强制切断，换行显示
-# 建议设置在 15-25 之间
+# 【功能开关】是否开启长句智能切分
+# True: 超过 MAX_CHARS_PER_LINE 字自动切断（适合直接看视频字幕）
+# False: 保持原句不切断（适合搜索关键词、做文档归档）
+ENABLE_SMART_SPLIT = False
+
+# 单行最大字数限制 (仅当 ENABLE_SMART_SPLIT = True 时生效)
 MAX_CHARS_PER_LINE = 18
 
 # 支持的视频后缀
@@ -64,13 +67,13 @@ def smart_split_segment(segment, max_chars=18):
         if current_len + word_len > max_chars and current_words:
             yield {
                 "start": segment_start,
-                "end": current_words[-1].end,  # 上一句结束于最后一个词的结尾
+                "end": current_words[-1].end,
                 "text": "".join([w.word for w in current_words]).strip()
             }
             # 重置下一句
             current_words = []
             current_len = 0
-            segment_start = word.start  # 下一句开始于当前词的开头
+            segment_start = word.start
 
         current_words.append(word)
         current_len += word_len
@@ -115,10 +118,11 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
         # 2. 开始转写
         start_time = time.time()
 
-        # 优化 Prompt (保留原来的短句诱导)
         magic_prompt = "饼干岁们好，我是岁己。今天直播玩游戏，杂谈唱歌。哎呀，这个好难啊？没关系，我们可以的。请多关照。"
 
-        # 【核心修改】开启 word_timestamps=True
+        # 这里做一个判断：如果需要切分，必须开启 word_timestamps
+        # 如果不需要切分，开启它可以提高精度，但关闭它可能会快一丢丢。
+        # 为了保证时间轴质量，建议始终开启。
         segments, _ = batched_model.transcribe(
             video_path,
             batch_size=BATCH_SIZE,
@@ -126,7 +130,7 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
             initial_prompt=magic_prompt,
             vad_filter=True,
             vad_parameters=vad_params,
-            word_timestamps=True  # <--- 必须开启这个才能切分
+            word_timestamps=True
         )
 
         # 准备进度条
@@ -137,11 +141,24 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
 
         with open(srt_path, "w", encoding="utf-8") as f:
             for raw_segment in segments:
-                # 使用智能切分生成器
-                for split_seg in smart_split_segment(raw_segment, MAX_CHARS_PER_LINE):
+
+                # --- 根据开关决定处理方式 ---
+                if ENABLE_SMART_SPLIT:
+                    # 使用智能切分
+                    sub_segments = smart_split_segment(raw_segment, MAX_CHARS_PER_LINE)
+                else:
+                    # 不切分，直接包装成列表，方便下面统一处理
+                    sub_segments = [{
+                        "start": raw_segment.start,
+                        "end": raw_segment.end,
+                        "text": raw_segment.text.strip()
+                    }]
+                # -------------------------
+
+                for split_seg in sub_segments:
                     line_count += 1
 
-                    # 进度条逻辑 (使用当前分段的 end 时间)
+                    # 进度条逻辑
                     current_time = split_seg['end']
                     percent = (current_time / total_duration) * 100
                     if percent > 100: percent = 100
@@ -162,7 +179,6 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
 
                     f.write(f"{line_count}\n{start_str} --> {end_str}\n{text}\n\n")
 
-                # 每处理完一个原始大段就刷新一次缓存
                 f.flush()
 
         total_time = time.time() - start_time
@@ -203,7 +219,7 @@ def main():
         return
 
     print(f"📋 共找到 {total_files} 个视频文件。")
-    print(f"📏 单行字幕限制: {MAX_CHARS_PER_LINE}字")
+    print(f"🔧 智能切分状态: {'✅ 开启' if ENABLE_SMART_SPLIT else '⛔ 关闭 (保留长句)'}")
     print("=" * 60)
 
     # 2. 初始化模型
