@@ -6,18 +6,26 @@ import traceback
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 # ================= ❄️ RTX 5080 取暖配置 ❄️ =================
-# 模型：Turbo (速度快，精度高，适合批量)
+# 模型：Turbo (速度快，精度高)
 MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
 
-# 显存够大，Batch Size 设为 16 或 24 均可
+# 显存够大，Batch Size 设为 16
 BATCH_SIZE = 16
 
-# 支持的视频后缀 (大小写均可)
-VIDEO_EXTS = {'.mp4', '.flv', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m4v'}
+# 【核心修改】单行最大字数限制
+# 超过这个长度(比如18个中文字)就会强制切断，换行显示
+# 建议设置在 15-25 之间
+MAX_CHARS_PER_LINE = 18
+
+# 支持的视频后缀
+VIDEO_EXTS = {'.mp4', '.flv', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m4v', '.m4a'}
+
+
 # ===========================================================
 
 def is_video_file(filename):
     return os.path.splitext(filename)[1].lower() in VIDEO_EXTS
+
 
 def format_timestamp(seconds):
     if seconds is None: return "00:00:00,000"
@@ -27,6 +35,56 @@ def format_timestamp(seconds):
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+# --- ✂️ 智能切分算法 ✂️ ---
+def smart_split_segment(segment, max_chars=18):
+    """
+    如果一句话太长，利用单词时间戳把它切成多句短字幕。
+    """
+    # 如果本来就很短，或者没有单词信息，直接返回原样
+    if len(segment.text) <= max_chars or not segment.words:
+        yield {
+            "start": segment.start,
+            "end": segment.end,
+            "text": segment.text.strip()
+        }
+        return
+
+    # 开始切分逻辑
+    current_words = []
+    current_len = 0
+    segment_start = segment.words[0].start
+
+    for word in segment.words:
+        word_text = word.word
+        word_len = len(word_text)
+
+        # 如果加上当前词会超长，且缓存里已经有词了 -> 立即结算上一句
+        if current_len + word_len > max_chars and current_words:
+            yield {
+                "start": segment_start,
+                "end": current_words[-1].end,  # 上一句结束于最后一个词的结尾
+                "text": "".join([w.word for w in current_words]).strip()
+            }
+            # 重置下一句
+            current_words = []
+            current_len = 0
+            segment_start = word.start  # 下一句开始于当前词的开头
+
+        current_words.append(word)
+        current_len += word_len
+
+    # 结算剩下的尾巴
+    if current_words:
+        yield {
+            "start": segment_start,
+            "end": current_words[-1].end,
+            "text": "".join([w.word for w in current_words]).strip()
+        }
+
+
+# -----------------------------
 
 def process_one_video(model, batched_model, video_path, file_idx, total_files):
     filename = os.path.basename(video_path)
@@ -41,66 +99,71 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
     # ------------------
 
     print(f"\n🎬 [{file_idx}/{total_files}] 正在处理: {filename}")
-    
+
     try:
-        # VAD 参数配置
         vad_params = {
-            "min_silence_duration_ms": 2000, 
-            "speech_pad_ms": 1500,           
+            "min_silence_duration_ms": 2000,
+            "speech_pad_ms": 1500,
         }
 
         # 1. 快速分析时长
         print("   🔍 分析视频时长...", end="", flush=True)
-        # 这里为了快，batch_size 用小一点探测即可，但用 batched_model 也行
         _, info = batched_model.transcribe(video_path, batch_size=BATCH_SIZE)
         total_duration = info.duration
         print(f" -> {format_timestamp(total_duration)}")
 
-        # --- 跳过过短视频 ---
-        if total_duration < 2.0:
-            print(f"   ⏭️  [跳过] 视频时长过短 (<2秒): {filename} ({format_timestamp(total_duration)})")
-            return
-        # ------------------
-
         # 2. 开始转写
         start_time = time.time()
-        
+
+        # 优化 Prompt (保留原来的短句诱导)
+        magic_prompt = "饼干岁们好，我是岁己。今天直播玩游戏，杂谈唱歌。哎呀，这个好难啊？没关系，我们可以的。请多关照。"
+
+        # 【核心修改】开启 word_timestamps=True
         segments, _ = batched_model.transcribe(
-            video_path, 
+            video_path,
             batch_size=BATCH_SIZE,
             language="zh",
-            initial_prompt="以下是二次元活泼快嘴现充川妹虚拟主播直播录像，杂谈唱歌、看电影、玩游戏，主要用简体中文，偶尔日文英文，生成合适长度的视频字幕。",
-            vad_filter=True,            
-            vad_parameters=vad_params   
+            initial_prompt=magic_prompt,
+            vad_filter=True,
+            vad_parameters=vad_params,
+            word_timestamps=True  # <--- 必须开启这个才能切分
         )
 
         # 准备进度条
         term_width = shutil.get_terminal_size().columns
-        bar_width = max(20, term_width - 50) 
+        bar_width = max(20, term_width - 50)
+
+        line_count = 0
 
         with open(srt_path, "w", encoding="utf-8") as f:
-            for i, segment in enumerate(segments, start=1):
-                current_time = segment.end
-                percent = (current_time / total_duration) * 100
-                if percent > 100: percent = 100
-                
-                elapsed = time.time() - start_time
-                speed = current_time / elapsed if elapsed > 0 else 0 
-                eta = (total_duration - current_time) / speed if speed > 0 else 0
-                
-                filled_len = int(bar_width * percent / 100)
-                bar = '█' * filled_len + '-' * (bar_width - filled_len)
-                
-                # 进度条显示
-                sys.stdout.write(f"\r   🚀 {percent:5.1f}% [{bar}] ETA:{int(eta)}s | {speed:.0f}x")
-                sys.stdout.flush()
+            for raw_segment in segments:
+                # 使用智能切分生成器
+                for split_seg in smart_split_segment(raw_segment, MAX_CHARS_PER_LINE):
+                    line_count += 1
 
-                start_str = format_timestamp(segment.start)
-                end_str = format_timestamp(segment.end)
-                text = segment.text.strip()
-                f.write(f"{i}\n{start_str} --> {end_str}\n{text}\n\n")
-                
-                if i % 10 == 0: f.flush() 
+                    # 进度条逻辑 (使用当前分段的 end 时间)
+                    current_time = split_seg['end']
+                    percent = (current_time / total_duration) * 100
+                    if percent > 100: percent = 100
+
+                    elapsed = time.time() - start_time
+                    speed = current_time / elapsed if elapsed > 0 else 0
+                    eta = (total_duration - current_time) / speed if speed > 0 else 0
+
+                    filled_len = int(bar_width * percent / 100)
+                    bar = '█' * filled_len + '-' * (bar_width - filled_len)
+
+                    sys.stdout.write(f"\r   🚀 {percent:5.1f}% [{bar}] ETA:{int(eta)}s | {speed:.0f}x")
+                    sys.stdout.flush()
+
+                    start_str = format_timestamp(split_seg['start'])
+                    end_str = format_timestamp(split_seg['end'])
+                    text = split_seg['text']
+
+                    f.write(f"{line_count}\n{start_str} --> {end_str}\n{text}\n\n")
+
+                # 每处理完一个原始大段就刷新一次缓存
+                f.flush()
 
         total_time = time.time() - start_time
         print(f"\n   ✅ 完成！耗时: {total_time:.1f}s")
@@ -108,27 +171,26 @@ def process_one_video(model, batched_model, video_path, file_idx, total_files):
     except Exception as e:
         print(f"\n   ❌ 处理失败: {filename}")
         print(f"   错误信息: {e}")
-        # 不抛出异常，为了让循环继续处理下一个文件
+        traceback.print_exc()
+
 
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    
+
     if len(sys.argv) < 2:
         print("❌ 请把【文件夹】拖拽到 .bat 图标上！")
         return
 
     input_path = sys.argv[1]
-    
+
     # 1. 扫描文件列表
     todo_list = []
     print(f"📂 正在扫描目录: {input_path}")
-    
+
     if os.path.isfile(input_path):
-        # 如果拖入的是单个文件
         if is_video_file(input_path):
             todo_list.append(input_path)
     else:
-        # 如果拖入的是目录 (递归扫描)
         for root, dirs, files in os.walk(input_path):
             for file in files:
                 if is_video_file(file):
@@ -141,9 +203,10 @@ def main():
         return
 
     print(f"📋 共找到 {total_files} 个视频文件。")
+    print(f"📏 单行字幕限制: {MAX_CHARS_PER_LINE}字")
     print("=" * 60)
 
-    # 2. 初始化模型 (只加载一次，极大节省时间)
+    # 2. 初始化模型
     print(f"⏳ 正在预热 RTX 5080 ({MODEL_SIZE})...")
     try:
         model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
@@ -156,17 +219,18 @@ def main():
 
     # 3. 循环处理
     start_all = time.time()
-    
+
     for idx, video_path in enumerate(todo_list, start=1):
         process_one_video(model, batched_model, video_path, idx, total_files)
-    
+
     end_all = time.time()
     duration = end_all - start_all
-    
+
     print("\n" + "=" * 60)
     print(f"🏆 所有任务全部完成！")
-    print(f"⏱️  总耗时: {int(duration//3600)}小时 {int((duration%3600)//60)}分")
+    print(f"⏱️  总耗时: {int(duration // 3600)}小时 {int((duration % 3600) // 60)}分")
     print("🛌 祝你好梦！")
+
 
 if __name__ == "__main__":
     main()
