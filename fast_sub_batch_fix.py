@@ -79,7 +79,7 @@ def main():
             video_path, 
             batch_size=BATCH_SIZE,
             language="zh",
-            initial_prompt="以下是二次元活泼快嘴现充川妹虚拟主播直播录像，杂谈唱歌、看电影、玩游戏，主要用简体中文，偶尔日文英文，生成合适长度的视频字幕。",
+            initial_prompt="饼干岁们好，我是岁己。今天直播玩游戏，杂谈唱歌。哎呀，这个好难啊？没关系，我们可以的。请多关照。",
             vad_filter=True,            
             vad_parameters=vad_params   
         )
