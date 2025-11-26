@@ -6,15 +6,18 @@ import traceback
 import gc
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
-# ================= ❄️ RTX 5080 ASMR 专享版 ❄️ =================
+# ================= ❄️ RTX 5080 终极智能降级版 ❄️ =================
+# 模型路径
 MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
-BATCH_SIZE = 12  # 稍微调低并发，求稳
 
-# ASMR 优化开关
-# 3D麦/睡眠导入通常声音很小，且有长时间底噪，需要调整参数
-IS_ASMR_MODE = True
+# 基础并发数 (Batch模式用)
+BATCH_SIZE = 12
 
-# 容错机制：如果生成的时长少了 60秒 以上，自动重跑
+# 【功能开关】是否开启长句智能切分
+ENABLE_SMART_SPLIT = False
+MAX_CHARS_PER_LINE = 18
+
+# 容错阈值：如果生成的时长比视频短了超过 60秒，触发降级
 TOLERANCE_SECONDS = 60
 MAX_RETRIES = 3
 
@@ -22,6 +25,10 @@ VIDEO_EXTS = {'.mp4', '.flv', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m4v', '.
 
 
 # ===========================================================
+
+def is_video_file(filename):
+    return os.path.splitext(filename)[1].lower() in VIDEO_EXTS
+
 
 def format_timestamp(seconds):
     if seconds is None: return "00:00:00,000"
@@ -33,114 +40,238 @@ def format_timestamp(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def transcribe_with_retry(batched_model, video_path, srt_path, total_duration):
-    # ASMR 专用参数：更敏感，不容易被切断
-    vad_params = {
-        "min_silence_duration_ms": 3000 if IS_ASMR_MODE else 2000,
-        "speech_pad_ms": 2000 if IS_ASMR_MODE else 1500,
-        "threshold": 0.3 if IS_ASMR_MODE else 0.5,  # 降低人声门槛
-    }
+# --- ✂️ 智能切分算法 ✂️ ---
+def smart_split_segment(segment, max_chars=18):
+    if len(segment.text) <= max_chars or not segment.words:
+        yield {"start": segment.start, "end": segment.end, "text": segment.text.strip()}
+        return
 
-    prompt = "饼干岁们好，我是岁己。今天直播3D麦，助眠，会有轻声细语和触发音。" if IS_ASMR_MODE else "大家好我是岁己，今天直播玩游戏杂谈。"
+    current_words = []
+    current_len = 0
+    segment_start = segment.words[0].start
+
+    for word in segment.words:
+        word_text = word.word
+        word_len = len(word_text)
+        if current_len + word_len > max_chars and current_words:
+            yield {"start": segment_start, "end": current_words[-1].end,
+                   "text": "".join([w.word for w in current_words]).strip()}
+            current_words = []
+            current_len = 0
+            segment_start = word.start
+        current_words.append(word)
+        current_len += word_len
+
+    if current_words:
+        yield {"start": segment_start, "end": current_words[-1].end,
+               "text": "".join([w.word for w in current_words]).strip()}
+
+
+def transcribe_with_strategy(model, video_path, srt_path, total_duration):
+    """
+    三级火箭策略：
+    1. Batch模式: 极速，但 ASMR 容易丢包
+    2. Sequential模式: 稍慢，但极度稳定，死磕到底
+    3. 核弹模式: 关闭 VAD，强行转写每一秒
+    """
+    prompt = "饼干岁们好，我是岁己。今天直播玩游戏，杂谈唱歌。哎呀，这个好难啊？没关系，我们可以的。请多关照。"
+
+    # 临时文件，防止写坏正式文件
+    temp_srt = srt_path + ".tmp"
 
     for attempt in range(1, MAX_RETRIES + 1):
-        print(f"   🚀 第 {attempt} 次尝试 (ASMR模式={'开' if IS_ASMR_MODE else '关'})...")
+        # --- 策略选择 ---
+        use_batch = True
+        use_vad = True
+        strategy_name = "🚀 [策略1] 极速 Batch 模式"
+
+        if attempt == 2:
+            use_batch = False
+            strategy_name = "🐢 [策略2] 稳健 Sequential 模式 (ASMR专用)"
+        elif attempt == 3:
+            use_batch = False
+            use_vad = False
+            strategy_name = "☢️ [策略3] 核弹模式 (关闭VAD，强制全写)"
+
+        print(f"\n👉 第 {attempt} 次尝试: 启用 {strategy_name}...")
+
+        # ASMR 专用宽松参数
+        vad_params = {
+            "min_silence_duration_ms": 3000,
+            "speech_pad_ms": 2000,
+            "threshold": 0.3
+        }
+
         start_time = time.time()
         last_segment_end = 0
         line_count = 0
-        temp_srt = srt_path + ".tmp"
 
         try:
-            # condition_on_previous_text=False 能防止在长时间静音中复读
-            segments, _ = batched_model.transcribe(
-                video_path,
-                batch_size=BATCH_SIZE,
-                language="zh",
-                initial_prompt=prompt,
-                vad_filter=True,
-                vad_parameters=vad_params,
-                word_timestamps=True,
-                condition_on_previous_text=False
-            )
+            segments = None
+            batched_model = None
 
+            if use_batch:
+                # 策略1：Batch Pipeline
+                batched_model = BatchedInferencePipeline(model=model)
+                segments, _ = batched_model.transcribe(
+                    video_path,
+                    batch_size=BATCH_SIZE,
+                    language="zh",
+                    initial_prompt=prompt,
+                    vad_filter=True,
+                    vad_parameters=vad_params,
+                    word_timestamps=True
+                )
+            else:
+                # 策略2 & 3：原生串行模式 (不经过 Pipeline)
+                segments, _ = model.transcribe(
+                    video_path,
+                    beam_size=5,
+                    language="zh",
+                    initial_prompt=prompt,
+                    vad_filter=use_vad,
+                    vad_parameters=vad_params if use_vad else None,
+                    word_timestamps=True,
+                    condition_on_previous_text=False
+                )
+
+            # 进度条
             term_width = shutil.get_terminal_size().columns
-            bar_width = max(20, term_width - 55)
+            bar_width = max(20, term_width - 65)
 
             with open(temp_srt, "w", encoding="utf-8") as f:
-                for segment in segments:
-                    last_segment_end = segment.end
-                    line_count += 1
+                for raw_segment in segments:
+                    last_segment_end = raw_segment.end
 
-                    # 进度条
-                    percent = (last_segment_end / total_duration) * 100
-                    if percent > 100: percent = 100
-                    elapsed = time.time() - start_time
-                    speed = last_segment_end / elapsed if elapsed > 0 else 0
+                    # 切分逻辑
+                    if ENABLE_SMART_SPLIT:
+                        sub_segments = smart_split_segment(raw_segment, MAX_CHARS_PER_LINE)
+                    else:
+                        sub_segments = [{
+                            "start": raw_segment.start, "end": raw_segment.end, "text": raw_segment.text.strip()
+                        }]
 
-                    filled = int(bar_width * percent / 100)
-                    bar = '█' * filled + '-' * (bar_width - filled)
+                    for split_seg in sub_segments:
+                        line_count += 1
 
-                    sys.stdout.write(f"\r   🔄 {percent:5.1f}% [{bar}] {speed:.1f}x")
-                    sys.stdout.flush()
+                        percent = (last_segment_end / total_duration) * 100
+                        if percent > 100: percent = 100
+                        elapsed = time.time() - start_time
+                        speed = last_segment_end / elapsed if elapsed > 0 else 0
+                        eta = (total_duration - last_segment_end) / speed if speed > 0 else 0
 
-                    start_s = format_timestamp(segment.start)
-                    end_s = format_timestamp(segment.end)
-                    text = segment.text.strip()
-                    f.write(f"{line_count}\n{start_s} --> {end_s}\n{text}\n\n")
+                        filled = int(bar_width * percent / 100)
+                        bar = '█' * filled + '-' * (bar_width - filled)
+
+                        icon = "⚡" if use_batch else "🐢"
+                        sys.stdout.write(f"\r   {icon} {percent:5.1f}% [{bar}] ETA:{int(eta)}s | {speed:.1f}x")
+                        sys.stdout.flush()
+
+                        start_s = format_timestamp(split_seg['start'])
+                        end_s = format_timestamp(split_seg['end'])
+                        text = split_seg['text']
+                        f.write(f"{line_count}\n{start_s} --> {end_s}\n{text}\n\n")
+
                     f.flush()
 
             print()
 
             # === 🛡️ 完整性检查 ===
             missing = total_duration - last_segment_end
-            if missing > TOLERANCE_SECONDS:
-                print(f"   ⚠️  警告: 居然缺了 {missing:.1f} 秒！")
-                print(f"   🚫 这肯定不正常，正在触发自动重试...")
-                if attempt < MAX_RETRIES:
-                    time.sleep(2)
-                    continue
-                else:
-                    print(f"   💀 没救了，保留现有结果吧。")
 
-            # 成功
+            # 只有当缺失严重，且视频本身不是特别短
+            if missing > TOLERANCE_SECONDS and total_duration > 120:
+                print(f"   ⚠️  警告: 缺失 {missing:.1f} 秒 (总长 {format_timestamp(total_duration)})")
+
+                if attempt < MAX_RETRIES:
+                    print(f"   🚫 当前策略不适合此视频 (ASMR音量过低)，准备切换策略重试...")
+                    time.sleep(2)
+                    continue  # 触发下一次循环(换策略)
+                else:
+                    print(f"   💀 所有策略耗尽，保留现有结果。")
+
+            # 成功：移动临时文件到目标路径
             if os.path.exists(srt_path): os.remove(srt_path)
             os.rename(temp_srt, srt_path)
             print(f"   ✅ 成功生成！耗时: {time.time() - start_time:.1f}s")
+
+            # 清理内存
+            if batched_model: del batched_model
+            gc.collect()
             return
 
         except Exception as e:
-            print(f"\n   ❌ 报错: {e}")
+            print(f"\n   ❌ 出错: {e}")
             traceback.print_exc()
             time.sleep(2)
 
 
+def process_one_video(model, video_path, file_idx, total_files):
+    filename = os.path.basename(video_path)
+    output_dir = os.path.dirname(video_path)
+    filename_no_ext = os.path.splitext(filename)[0]
+    srt_path = os.path.join(output_dir, filename_no_ext + ".srt")
+
+    # --- 智能防覆盖逻辑 (你要求的) ---
+    counter = 1
+    original_srt_path = srt_path
+    while os.path.exists(srt_path):
+        # 如果文件存在但很小(可能是失败的产物)，直接覆盖；否则重命名
+        if os.path.getsize(srt_path) < 100:
+            break
+        new_filename = f"{filename_no_ext}_{counter}.srt"
+        srt_path = os.path.join(output_dir, new_filename)
+        counter += 1
+
+    if counter > 1:
+        print(f"✨ 自动重命名为: {os.path.basename(srt_path)}")
+    # ------------------
+
+    print(f"\n🎬 [{file_idx}/{total_files}] 正在处理: {filename}")
+
+    try:
+        # 获取时长 (不使用 pipeline，使用原生 model 快速探测)
+        print("   🔍 分析视频时长...", end="", flush=True)
+        _, info = model.transcribe(video_path, beam_size=1, temperature=0, no_speech_threshold=1.0,
+                                   condition_on_previous_text=False)
+        total_duration = info.duration
+        print(f" -> {format_timestamp(total_duration)}")
+
+        # 核心逻辑
+        transcribe_with_strategy(model, video_path, srt_path, total_duration)
+
+    except Exception as e:
+        print(f"\n   ❌ 预处理失败: {e}")
+
+
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    if len(sys.argv) < 2: return
+    if len(sys.argv) < 2:
+        print("❌ 请拖拽文件！")
+        return
 
     input_path = sys.argv[1]
-    # ... (扫描文件逻辑省略，保持不变) ...
+    todo_list = []
     if os.path.isfile(input_path):
-        todo_list = [input_path]
+        if is_video_file(input_path): todo_list.append(input_path)
     else:
-        todo_list = []  # 简写了，逻辑同前
+        for root, dirs, files in os.walk(input_path):
+            for file in files:
+                if is_video_file(file): todo_list.append(os.path.join(root, file))
 
-    print(f"🔥 正在加载 Whisper (Watchdog版)...")
+    print(f"🔥 正在加载 RTX 5080 引擎 (ASMR 智能版)...")
     try:
+        # 这里只加载基础模型，BatchPipeline 在策略1里动态创建
         model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
-        batched_model = BatchedInferencePipeline(model=model)
     except Exception as e:
         print(f"❌ 显卡报错: {e}")
         return
 
     for idx, video_path in enumerate(todo_list, start=1):
-        print(f"\n🎬 处理: {os.path.basename(video_path)}")
-        try:
-            _, info = batched_model.transcribe(video_path, batch_size=4)
-            transcribe_with_retry(batched_model, video_path, os.path.splitext(video_path)[0] + ".srt", info.duration)
-            gc.collect()
-        except Exception as e:
-            print(f"❌ 失败: {e}")
+        process_one_video(model, video_path, idx, len(todo_list))
+        gc.collect()
+
+    print(f"\n🏆 全部完成！")
 
 
 if __name__ == "__main__":
